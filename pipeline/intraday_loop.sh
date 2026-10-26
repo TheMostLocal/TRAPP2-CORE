@@ -102,6 +102,22 @@ live_push() {
   else python pipeline/supabase_live.py || true; fi
 }
 
+# z161: when this job stops for its TIME BUDGET while its window is still open, it queues the next run of its own
+# workflow - GitHub's scheduler went hours without starting anything (2026-10-26: no intraday run by 0900 ET).
+# Needs `actions: write` and GH_TOKEN (the job's own token) in the workflow; the concurrency group queues the new
+# run behind this one. GitHub's schedule and the Supabase heartbeat (supabase/heartbeat.sql) stay as backstops.
+chain_next() {
+  [ -n "${GH_TOKEN:-}" ] || { echo "::notice::GH_TOKEN not set - not chaining"; return 0; }
+  local wf="${GITHUB_WORKFLOW_REF:-}"
+  wf="${wf%@*}"; wf="${wf##*/}"
+  { [ -n "$wf" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; } || return 0
+  if gh workflow run "$wf" --ref "${GITHUB_REF_NAME:-main}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+    echo "chained: the next run of $wf is queued"
+  else
+    echo "::warning::could not queue the next run of $wf (does the workflow grant actions: write?)"
+  fi
+}
+
 commit_push() {
   OWN="data/master.csv data/master.json data/intraday data/bars data/signals.json data/regime_current.json data/regime_history.json"
   for f in $OWN; do [ -e "$f" ] && git add -A "$f"; done          # one missing path must not block the rest
@@ -144,7 +160,7 @@ while :; do
   if [ -n "$ev" ] && [ "$ev" -lt "$wait" ]; then
     wait=$ev; EVENT=$( [ "$(TZ=America/New_York date -d "@$(( now + ev ))" +%H)" -lt 12 ] && echo open || echo close )
   fi
-  if [ $(( now - start + wait + 120 )) -gt "$BUDGET" ]; then echo "time budget reached - the next scheduled start continues"; break; fi
+  if [ $(( now - start + wait + 120 )) -gt "$BUDGET" ]; then echo "time budget reached - queueing the next run"; chain_next; break; fi
   echo "sleeping ${wait}s"
   sleep "$wait"
 done
