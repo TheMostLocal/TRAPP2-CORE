@@ -53,6 +53,9 @@ else
 fi
 core_overlay
 [ -n "${CORE_DIR:-}" ] && echo "shared pipeline: TRAPP2-CORE${ALPACA_KEY_ID:+ · Alpaca on}"
+# z168: say whether quotes go to Supabase - a silent skip looked like a failure on the health card
+if [ -n "${SUPABASE_LIVE_URL:-}" ] && [ -n "${SUPABASE_LIVE_KEY:-}" ]; then echo "Supabase live: ON → $(echo "$SUPABASE_LIVE_URL" | sed -E 's#https?://([^.]+)\..*#\1#')"
+else echo "::notice::Supabase live: OFF - add SUPABASE_LIVE_URL and SUPABASE_LIVE_KEY (the PORT+ANALYTICS project's URL and service key) to this repo's Actions secrets"; fi
 DAY=$(python pipeline/intraday_session.py 2>/dev/null || echo trading)
 SINGLE=""
 in_window || SINGLE="started outside the session window (${START}Z-${STOP}Z)"
@@ -138,6 +141,29 @@ commit_push() {
   echo "::warning::push failed after 5 attempts this pass"
 }
 
+# z168: between sessions the loop keeps itself alive instead of waiting for GitHub's scheduler (which started only a
+# few of the hourly triggers on 10-26..10-30): after the window closes on a weeknight it sleeps until the next one
+# opens - or to the end of this job, then queues the next. Gaps longer than LOOP_BRIDGE_MAX_H (12 h: weekends,
+# holidays) aren't bridged; the heartbeat / schedule starts those.
+bridge() {
+  [ "${LOOP_BRIDGE:-1}" = "1" ] || return 1
+  local nxt now left
+  nxt=$(python pipeline/next_window.py 2>/dev/null)
+  if [ -z "$nxt" ]; then echo "next window is more than ${LOOP_BRIDGE_MAX_H:-12} h away (weekend / holiday) - not bridging"; return 1; fi
+  now=$(date +%s); left=$(( start + BUDGET - now - 180 ))
+  if [ "$nxt" -le "$left" ]; then
+    echo "bridging: the next window opens in $(( nxt / 60 )) min - sleeping until then"
+    sleep "$nxt"
+    DAY=$(python pipeline/intraday_session.py 2>/dev/null || echo trading)
+    SINGLE=""
+    return 0
+  fi
+  echo "bridging: the next window opens in $(( nxt / 60 )) min - sleeping to the end of this job, then queueing the next"
+  [ "$left" -gt 0 ] && sleep "$left"
+  chain_next
+  return 2
+}
+
 i=0
 EVENT=""
 while :; do
@@ -149,10 +175,17 @@ while :; do
   git pull -q --no-rebase -X ours origin "$BRANCH" 2>/dev/null || true
   core_overlay
   now=$(date +%s)
-  if [ -n "$SINGLE" ]; then echo "$SINGLE - one pass only"; break; fi
-  if [ "$DAY" != "trading" ] && [ -z "${INTRADAY_FORCE:-}" ]; then echo "not a trading day ($DAY) - one pass only"; break; fi
   if [ "$i" -ge "$MAX" ]; then echo "max passes reached"; break; fi
-  if ! in_window; then echo "past the session window (${STOP}Z) - done"; break; fi
+  why=""
+  if [ -n "$SINGLE" ]; then why="$SINGLE"
+  elif [ "$DAY" != "trading" ] && [ -z "${INTRADAY_FORCE:-}" ]; then why="not a trading day ($DAY)"
+  elif ! in_window; then why="past the session window (${STOP}Z)"; fi
+  if [ -n "$why" ]; then
+    echo "$why"
+    bridge; rc=$?
+    [ "$rc" -eq 0 ] && continue
+    break
+  fi
   wait=$(( INTERVAL - (now % INTERVAL) + OFFSET ))
   [ "$wait" -gt "$INTERVAL" ] && wait=$(( wait - INTERVAL ))
   [ "$wait" -lt 30 ] && wait=$(( wait + INTERVAL ))
