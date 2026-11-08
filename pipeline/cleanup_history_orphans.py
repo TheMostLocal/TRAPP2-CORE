@@ -45,11 +45,32 @@ def log(*a):
     print("[cleanup]", *a, flush=True)
 
 
+# z178 - listing symbols -> the form Yahoo, the SEC and every book use. Exchange lists (NYSE / Nasdaq "ACT"
+# symbols, datahub.io, the app's CSV) write preferreds with "$" and share classes with ".": Yahoo has no
+# "ABR$D" or "BRK.B", so those lines fetched nothing ("$" also breaks shell steps and file names). Normalized
+# where tickers.txt is read, so the txt files can hold either form:
+#   ABR$D -> ABR-PD (preferred)   BRK.B -> BRK-B (class)   XYZ.U -> XYZ-UN (unit)   XYZ.W / .WS -> XYZ-WT (warrant)
+#   XYZ.R -> XYZ-RI (right)       exchange suffixes (.L .PA .SW .HK .T .TO ...) and everything else unchanged
+def norm_symbol(t):
+    import re as _re
+    t = (t or "").strip().upper()
+    if "$" in t:
+        root, ser = t.split("$", 1)
+        return f"{root}-P{ser}" if ser else f"{root}-P"
+    m = _re.fullmatch(r"([A-Z]{1,5})\.(U|W|WS|R)", t)
+    if m:
+        return m.group(1) + {"U": "-UN", "W": "-WT", "WS": "-WT", "R": "-RI"}[m.group(2)]
+    m = _re.fullmatch(r"([A-Z]{1,5})\.([A-C]|V)", t)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return t
+
+
 def load_valid():
     valid = set(t.upper() for t in REQUIRED_REFERENCE_TICKERS)
     if TICKERS_FILE.exists():
         for line in TICKERS_FILE.read_text().splitlines():
-            t = line.strip().split("#")[0].strip().upper()
+            t = norm_symbol(line.strip().split("#")[0])        # z178: same names fetch_history.py writes
             if t:
                 valid.add(t)
     return valid
