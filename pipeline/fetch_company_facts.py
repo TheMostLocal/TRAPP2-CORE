@@ -108,6 +108,31 @@ NON_COMPANY_TICKERS = {
     "RSP", "SPLV", "SPHQ", "MTUM", "QUAL", "USMV", "SCHD",
 }
 
+# z178 - listing symbols -> the form Yahoo, the SEC and every book use. Exchange lists (NYSE / Nasdaq "ACT"
+# symbols, datahub.io, the app's CSV) write preferreds with "$" and share classes with ".": Yahoo has no
+# "ABR$D" or "BRK.B", so those lines fetched nothing ("$" also breaks shell steps and file names). Normalized
+# where tickers.txt is read, so the txt files can hold either form:
+#   ABR$D -> ABR-PD (preferred)   BRK.B -> BRK-B (class)   XYZ.U -> XYZ-UN (unit)   XYZ.W / .WS -> XYZ-WT (warrant)
+#   XYZ.R -> XYZ-RI (right)       exchange suffixes (.L .PA .SW .HK .T .TO ...) and everything else unchanged
+def norm_symbol(t):
+    import re as _re
+    t = (t or "").strip().upper()
+    if "$" in t:
+        root, ser = t.split("$", 1)
+        return f"{root}-P{ser}" if ser else f"{root}-P"
+    m = _re.fullmatch(r"([A-Z]{1,5})\.(U|W|WS|R)", t)
+    if m:
+        return m.group(1) + {"U": "-UN", "W": "-WT", "WS": "-WT", "R": "-RI"}[m.group(2)]
+    m = _re.fullmatch(r"([A-Z]{1,5})\.([A-C]|V)", t)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return t
+
+
+import re as _re_mod
+_re_pref = _re_mod.compile(r"-(P[A-Z]?|UN|WT|RI)$")
+
+
 def load_tickers_from_file():
     """
     Load tickers from data/tickers.txt — one ticker per line, comments with #.
@@ -128,8 +153,10 @@ def load_tickers_from_file():
     seen = set()
     for line in TICKERS_FILE.read_text().splitlines():
         # Strip comments
-        t = line.split("#")[0].strip().upper()
+        t = norm_symbol(line.split("#")[0])                 # z178: ABR$D -> ABR-PD, BRK.B -> BRK-B
         if not t:
+            continue
+        if _re_pref.search(t):                              # z178: preferreds, units, warrants, rights aren't companies
             continue
         # Filter non-companies
         if any(t.endswith(suffix) for suffix in NON_COMPANY_PATTERNS):
