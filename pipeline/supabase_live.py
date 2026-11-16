@@ -94,10 +94,11 @@ def quote_rows(master, since):
         fa = str(r.get("fetched_at") or "")
         if not t or not fa or (since and fa <= since):
             continue
+        # z187: currency = the PRICE's currency (it was the statements' - TSM's live quote said TWD)
         out.append({"ticker": t, "book": BOOK, "price": num(r.get("price")), "change": num(r.get("change")), "changepct": num(r.get("changepct")),
                     "priceopen": num(r.get("priceopen")), "high": num(r.get("high")), "low": num(r.get("low")), "closeyest": num(r.get("closeyest")),
                     "volume": num(r.get("volume")), "marketcap": num(r.get("marketcap")),
-                    "currency": r.get("financialCurrency") or r.get("currency") or None, "date": (str(r.get("date") or "")[:10] or None), "fetched_at": fa})
+                    "currency": r.get("currency") or None, "date": (str(r.get("date") or "")[:10] or None), "fetched_at": fa})
         newest = max(newest or "", fa)
     return out, newest
 
