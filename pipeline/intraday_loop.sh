@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # intraday_loop.sh - ONE Actions job writes the whole session's 15-minute tape (z115).
 # Shared: TRAPP2-CORE's copy runs in every book (TRAPP2, TRAPP2-1, TRAPP2-2, TRAPP2-3, TRAPP2-4 - the workflow copies
-# it over the book's own before starting); TRAPP2-4 keeps an identical copy for when CORE can't be checked out.
+# it over the book's own before starting); TRAPP2-4 keeps a copy for when CORE can't be checked out (z189: leave the
+# books' copies as they are - committing a file CORE overlays into a book while its loop runs leaves that file "locally
+# changed" in the running job, so its merges, and with them its pushes, fail until the job ends).
 # z181: on a push conflict a master the Nightly rebuilt meanwhile wins over this pass's quote refresh (see commit_push).
+# z189: the loop also STARTS THIS BOOK'S SCHEDULED WORKFLOWS ON TIME (pipeline/ontime.py - the Nightly at its own cron
+# time on trading-day evenings, the mid-day regime refresh, TRAPP2-1's extras / Fed / quad / trade / nowcast): GitHub
+# starts this account's crons 6-7 h late. Every sleep wakes for those slots (nap); a Friday / holiday-eve job stays up to
+# LOOP_SLOT_HORIZON_MIN (180) after the window for a slot before it ends (drain_slots). ONTIME=0 turns it off.
 #
 # Why: GitHub's scheduler delays and drops most "every 15 minutes" crons (the
 # live tape had 4 points on 2026-10-15: 13:09, 17:36, 20:33, 23:19 UTC). So a
@@ -131,6 +137,42 @@ chain_next() {
   fi
 }
 
+# z189: this book's other scheduled workflows, queued on time (pipeline/ontime.py; the CORE overlay brings it). Best-effort:
+# a failure here is a log line, never a stop. nap sleeps like `sleep`, but wakes on the way for each slot and queues it.
+ontime_run()  { [ "${ONTIME:-1}" = "1" ] && [ -f pipeline/ontime.py ] && python pipeline/ontime.py run; return 0; }
+ontime_next() { [ "${ONTIME:-1}" = "1" ] && [ -f pipeline/ontime.py ] && python pipeline/ontime.py next 2>/dev/null; return 0; }
+nap() {
+  local end now n
+  end=$(( $(date +%s) + $1 ))
+  while now=$(date +%s); [ "$now" -lt "$end" ]; do
+    n=$(ontime_next)
+    if [ -n "$n" ] && [ "$n" -ge 0 ] 2>/dev/null && [ $(( now + n )) -le $(( end + 5 )) ]; then
+      echo "  on-time slot in $(( n / 60 )) min"
+      [ "$n" -gt 0 ] && sleep "$n"
+      ontime_run
+    else
+      sleep $(( end - now ))
+    fi
+  done
+}
+# z189: before the job ends for the night (weekend / holiday ahead, or bridging off), stay for any slot due within
+# LOOP_SLOT_HORIZON_MIN (the Friday Nightly at 00:30-01:07 UTC); one past this job's budget is left to a queued next run.
+drain_slots() {
+  local n left
+  while :; do
+    n=$(ontime_next)
+    { [ -n "$n" ] && [ "$n" -ge 0 ] 2>/dev/null && [ "$n" -le $(( ${LOOP_SLOT_HORIZON_MIN:-180} * 60 )) ]; } || return 0
+    left=$(( start + BUDGET - $(date +%s) - 180 ))
+    if [ "$n" -gt "$left" ]; then
+      echo "an on-time slot in $(( n / 60 )) min is past this job's budget - queueing the next run for it"
+      chain_next
+      return 0
+    fi
+    echo "staying $(( n / 60 )) min for an on-time slot"
+    nap "$n"
+  done
+}
+
 commit_push() {
   OWN="data/master.csv data/master.json data/intraday data/bars data/signals.json data/regime_current.json data/regime_history.json"
   for f in $OWN; do [ -e "$f" ] && git add -A "$f"; done          # one missing path must not block the rest
@@ -179,13 +221,13 @@ bridge() {
   now=$(date +%s); left=$(( start + BUDGET - now - 180 ))
   if [ "$nxt" -le "$left" ]; then
     echo "bridging: the next window opens in $(( nxt / 60 )) min - sleeping until then"
-    sleep "$nxt"
+    nap "$nxt"                                                  # z189: wakes for the Nightly's slot on the way
     DAY=$(python pipeline/intraday_session.py 2>/dev/null || echo trading)
     SINGLE=""
     return 0
   fi
   echo "bridging: the next window opens in $(( nxt / 60 )) min - sleeping to the end of this job, then queueing the next"
-  [ "$left" -gt 0 ] && sleep "$left"
+  [ "$left" -gt 0 ] && nap "$left"
   chain_next
   return 2
 }
@@ -197,6 +239,7 @@ while :; do
   echo "── pass $i · $(date -u +%H:%M:%S)Z · $(TZ=America/New_York date +%H%M) ET${EVENT:+ · official ${EVENT} capture}"
   if [ -n "$EVENT" ]; then event_pass; else one_pass; fi
   EVENT=""
+  ontime_run                                                  # z189: any of this book's workflows due now
   # keep the checkout current so the next pass builds on what's on GitHub
   git pull -q --no-rebase -X ours origin "$BRANCH" 2>/dev/null || true
   core_overlay
@@ -210,6 +253,7 @@ while :; do
     echo "$why"
     bridge; rc=$?
     [ "$rc" -eq 0 ] && continue
+    [ "$rc" -eq 1 ] && drain_slots                            # z189: e.g. Friday's Nightly, 30-67 min after the window
     break
   fi
   wait=$(( INTERVAL - (now % INTERVAL) + OFFSET ))
@@ -221,6 +265,6 @@ while :; do
   fi
   if [ $(( now - start + wait + 120 )) -gt "$BUDGET" ]; then echo "time budget reached - queueing the next run"; chain_next; break; fi
   echo "sleeping ${wait}s"
-  sleep "$wait"
+  nap "$wait"
 done
 echo "intraday loop done: $i pass(es)"
