@@ -17,6 +17,8 @@ bar live, so its Close is the latest price during the session:
     closeyest                                        <- previous bar's close
     change, changepct (percent, like fetch_data.py), date, fetched_at
     marketcap                                        <- scaled by the price move
+    pe, dividend_yield, priceToBook, priceToSales,   <- z187: re-priced with it, so no ratio lags the price
+    evToRevenue, evToEbitda                             (see reprice_valuation)
 Tickers the batch can't price keep their previous values.
 
 Exit 0 when >= 80% of rows were refreshed; exit 2 otherwise so the workflow
@@ -24,6 +26,7 @@ falls back to the full fetch_data.py (`fetch_quotes_fast.py || fetch_data.py`).
 """
 import csv
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +116,63 @@ def _yahoo_download(tickers):
     return frames
 
 
+def split_like(k):
+    """z187: a price move that looks like a split / reverse split (x2, x1/3, x10 ...) - market cap and the ratios don't
+    move with it; the nightly refreshes the profile on the other side of it."""
+    if not k or k <= 0 or abs(math.log(k)) < math.log(1.4):
+        return False
+    r = k if k > 1 else 1 / k
+    return any(abs(r / n - 1) < 0.04 for n in (1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 100))
+
+
+def reprice_valuation(r, pulled, old_px, new_px):
+    """z187: every price-dependent field follows the price the way fetch_data.py computed it at the nightly:
+         market cap x (new / old), P/E x (new / old), dividend yield / (new / old)
+         P/B = market cap (USD) / bookUSD, P/S = market cap (USD) / revenueUSD,
+         EV/Revenue, EV/EBITDA = (market cap (USD) + netDebtUSD) / revenueUSD, ebitdaUSD
+       from the USD anchors the nightly writes on each equity row (fxQuote = USD per unit of the market cap's
+       currency). A ratio the nightly left blank (negative book, EV for a bank) stays blank. A row written before
+       z187 (no anchors) scales its P/B with the price and keeps its EV ratios. Returns 'anchored' / 'scaled' /
+       'split' / ''."""
+    if not (old_px and new_px and old_px > 0 and new_px > 0):
+        return ""
+    k = new_px / old_px
+    if split_like(k):
+        return "split"
+    get = lambda col: _num(pulled.get(col, r.get(col)))
+    mc = get("marketcap")
+    if mc and mc > 0:
+        mc = mc * k
+        _set(r, "marketcap", fmt_num(round(mc)))
+    pe = get("pe")
+    if pe and pe > 0:
+        _set(r, "pe", fmt_num(pe * k))
+    dy = get("dividend_yield")
+    if dy and dy > 0:
+        _set(r, "dividend_yield", fmt_num(dy / k))
+    fxq = _num(r.get("fxQuote"))
+    mc_usd = mc * fxq if (mc and mc > 0 and fxq and fxq > 0) else None
+    if mc_usd is None:
+        pb = get("priceToBook")
+        if pb and pb > 0:
+            _set(r, "priceToBook", fmt_num(pb * k))
+        return "scaled"
+    book, rev = _num(r.get("bookUSD")), _num(r.get("revenueUSD"))
+    ebitda, nd = _num(r.get("ebitdaUSD")), _num(r.get("netDebtUSD"))
+    has = lambda col: str(pulled.get(col, r.get(col)) or "").strip() != ""
+    if book and book > 0 and has("priceToBook"):
+        _set(r, "priceToBook", fmt_num(mc_usd / book))
+    if rev and rev > 0 and has("priceToSales"):
+        _set(r, "priceToSales", fmt_num(mc_usd / rev))
+    if nd is not None:
+        ev = mc_usd + nd
+        if rev and rev > 0 and has("evToRevenue"):
+            _set(r, "evToRevenue", fmt_num(ev / rev))
+        if ebitda and ebitda > 0 and has("evToEbitda"):
+            _set(r, "evToEbitda", fmt_num(ev / ebitda))
+    return "anchored"
+
+
 def _set(r, col, val):
     """Write a fresh pulled value. If a human (XTRAPP) override owns this field,
     the override stays in place and the fresh value goes to _pulled - which is
@@ -124,8 +184,9 @@ def _set(r, col, val):
         r[col] = val
 
 
-def refresh(rows, bars, now_iso):
+def refresh(rows, bars, now_iso, stats=None):
     ok = 0
+    stats = stats if stats is not None else {}
     for r in rows:
         t = str(r.get("ticker") or "")
         b = bars.get(t)
@@ -135,7 +196,6 @@ def refresh(rows, bars, now_iso):
         prev = b[-2][4] if len(b) >= 2 else _num(r.get("closeyest"))
         pulled = r.get("_pulled") if isinstance(r.get("_pulled"), dict) else {}
         old_px = _num(pulled.get("price", r.get("price")))
-        old_mc = _num(pulled.get("marketcap", r.get("marketcap")))
         for col, val in (("price", fmt_num(c)), ("close", fmt_num(c)), ("priceopen", fmt_num(o)),
                          ("high", fmt_num(h)), ("low", fmt_num(lo))):
             _set(r, col, val)
@@ -145,8 +205,9 @@ def refresh(rows, bars, now_iso):
             _set(r, "closeyest", fmt_num(prev))
             _set(r, "change", fmt_num(c - prev))
             _set(r, "changepct", fmt_num((c - prev) / prev * 100))
-        if old_mc and old_px:
-            _set(r, "marketcap", fmt_num(round(old_mc * c / old_px)))
+        how = reprice_valuation(r, pulled, old_px, c)         # z187: market cap + every ratio at the new price
+        if how:
+            stats[how] = stats.get(how, 0) + 1
         _set(r, "date", d)
         r["fetched_at"] = now_iso
         ok += 1
@@ -164,9 +225,12 @@ def main():
         return 2
     t0 = datetime.now(timezone.utc)
     bars = download(tickers)
-    ok = refresh(rows, bars, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    stats = {}
+    ok = refresh(rows, bars, datetime.now(timezone.utc).isoformat(timespec="seconds"), stats)
     secs = (datetime.now(timezone.utc) - t0).total_seconds()
-    log(f"refreshed {ok}/{len(rows)} rows in {secs:.0f}s")
+    log(f"refreshed {ok}/{len(rows)} rows in {secs:.0f}s · valuation re-priced: {stats.get('anchored', 0)} from USD anchors, "
+        f"{stats.get('scaled', 0)} scaled (rows from before z187)"
+        + (f" · {stats['split']} split-like moves left for the nightly" if stats.get("split") else ""))
     if ok < MIN_OK * len(rows):
         log(f"fewer than {MIN_OK:.0%} priced — leaving files untouched, falling back to the full fetch")
         return 2
