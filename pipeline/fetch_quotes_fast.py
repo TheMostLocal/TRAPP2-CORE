@@ -23,6 +23,13 @@ Tickers the batch can't price keep their previous values.
 
 Exit 0 when >= 80% of rows were refreshed; exit 2 otherwise so the workflow
 falls back to the full fetch_data.py (`fetch_quotes_fast.py || fetch_data.py`).
+
+z195: data/tickers.txt is the list, within one pass. A ticker added there gets its row on the next pass - built the
+way the nightly builds it (the book's own fetch_data.fetch_quote: quote + profile + valuation), as soon as it trades
+(a new listing: from its first trade); a ticker removed there (commented out) leaves master on the next pass.
+Until z195 both waited for the nightly full fetch (an IPO added in the morning appeared that evening, a removed
+symbol stayed all day). Nothing else is deleted: history, profiles and archives stay. A damaged or half-read list
+never empties the book - more than max(3, 5 %) of the rows missing from it is left for the nightly.
 """
 import csv
 import json
@@ -37,6 +44,8 @@ MASTER_JSON = DATA / "master.json"
 MASTER_CSV = DATA / "master.csv"
 CHUNK = 100
 MIN_OK = 0.80
+SYNC_MAX_ADD = 25          # z195: new tickers built per pass (each is one quote + one profile call)
+SYNC_MAX_DROP = 0.05       # z195: at most this share of the rows (or 3) leaves in a fast pass
 
 
 def log(*a):
@@ -214,11 +223,85 @@ def refresh(rows, bars, now_iso, stats=None):
     return ok
 
 
+def sync_with_list(rows):
+    """z195: bring master in line with data/tickers.txt (+ the book's reference tickers) - see the module note.
+    Every book's list also carries dead symbols (acquired, delisted, typos: 2-46 a book on 11-19) that the nightly
+    can't price, so "listed but no row" is not "new". One batched Yahoo request asks which of them trade at all; only a
+    ticker with a fresh bar gets its row built (the book's fetch_quote). Returns (rows, added, dropped, unpriced).
+    Any failure leaves the rows exactly as they were."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import fetch_data as fd                       # the book's own script: its list, its classifier, its row builder
+        want = [str(t).upper() for t in fd.load_tickers() if t]
+    except Exception as e:
+        log(f"  list sync skipped ({type(e).__name__}: {str(e)[:120]})")
+        return rows, [], [], []
+    if not want:
+        return rows, [], [], []
+    wanted = set(want)
+    have = {str(r.get("ticker") or "").upper() for r in rows}
+    dropped = [str(r.get("ticker")) for r in rows if str(r.get("ticker") or "").upper() not in wanted]
+    if dropped and (len(dropped) > max(3, SYNC_MAX_DROP * len(rows)) or len(wanted) < 0.5 * len(have)):
+        log(f"  ⚠ list sync: {len(dropped)} rows are not in tickers.txt - too many for a fast pass, left for the nightly "
+            f"({', '.join(dropped[:10])}{' …' if len(dropped) > 10 else ''})")
+        dropped = []
+    if dropped:
+        gone = {t.upper() for t in dropped}
+        rows = [r for r in rows if str(r.get("ticker") or "").upper() not in gone]
+        log(f"  list sync: {', '.join(dropped)} left master (removed from tickers.txt; history and archives kept)")
+    missing = [t for t in want if t not in have]
+    added, unpriced = [], []
+    if not missing:
+        return rows, added, dropped, unpriced
+    try:
+        bars = _yahoo_download(missing)               # one batched request: which of them trade at all
+    except Exception as e:
+        log(f"  list sync: price check failed ({type(e).__name__}: {str(e)[:100]}) - next pass")
+        return rows, added, dropped, missing
+    today = datetime.now(timezone.utc).date()
+    live = []
+    for t in missing:
+        b = bars.get(t)
+        try:
+            fresh = bool(b) and (today - datetime.strptime(b[-1][0], "%Y-%m-%d").date()).days <= 5
+        except ValueError:
+            fresh = False
+        (live if fresh else unpriced).append(t)
+    if live:
+        try:
+            fd.load_fx_rates(())
+        except Exception as e:
+            log(f"  list sync: FX rates unavailable ({type(e).__name__}) - a new non-USD row keeps its cross-currency ratios blank")
+        cache = dict(fd.load_profile_cache())          # a copy: the profile cache file is the nightly's, never rewritten here
+        for t in live[:SYNC_MAX_ADD]:
+            try:
+                row = fd.fetch_quote(t, cache)
+            except Exception as e:
+                log(f"  list sync: {t} failed ({type(e).__name__}: {str(e)[:100]}) - next pass")
+                row = None
+            if not row:
+                unpriced.append(t)
+                continue
+            row.pop("_noProfile", None)
+            row.setdefault("ticker", t)
+            rows.append(row)
+            added.append(t)
+        if added:
+            log(f"  list sync: {', '.join(added)} added from tickers.txt (row built like the nightly's)")
+        if len(live) > SYNC_MAX_ADD:
+            log(f"  list sync: {len(live) - SYNC_MAX_ADD} more new tickers follow on the next passes")
+    if unpriced:
+        log(f"  list sync: {len(unpriced)} listed ticker(s) with no row and no price - dead symbols, or a listing that "
+            f"hasn't traded yet (asked again next pass): {', '.join(unpriced[:8])}{' …' if len(unpriced) > 8 else ''}")
+    return rows, added, dropped, unpriced
+
+
 def main():
     if not MASTER_JSON.exists():
         log("no data/master.json yet — run the full fetch")
         return 2
     rows = json.loads(MASTER_JSON.read_text())
+    rows, added, dropped, _ = sync_with_list(rows)                       # z195
     tickers = [str(r.get("ticker")) for r in rows if r.get("ticker")]
     if not tickers:
         log("master.json has no tickers")
@@ -230,10 +313,11 @@ def main():
     secs = (datetime.now(timezone.utc) - t0).total_seconds()
     log(f"refreshed {ok}/{len(rows)} rows in {secs:.0f}s · valuation re-priced: {stats.get('anchored', 0)} from USD anchors, "
         f"{stats.get('scaled', 0)} scaled (rows from before z187)"
-        + (f" · {stats['split']} split-like moves left for the nightly" if stats.get("split") else ""))
+        + (f" · {stats['split']} split-like moves left for the nightly" if stats.get("split") else "")
+        + (f" · list sync: +{len(added)} -{len(dropped)}" if (added or dropped) else ""))
     if ok < MIN_OK * len(rows):
         log(f"fewer than {MIN_OK:.0%} priced — leaving files untouched, falling back to the full fetch")
-        return 2
+        return 2                                  # (the full fetch reads tickers.txt itself: adds / removals land there)
     MASTER_JSON.write_text(json.dumps(rows, separators=(",", ":")))
     if MASTER_CSV.exists():
         with MASTER_CSV.open(encoding="utf-8") as f:
